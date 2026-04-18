@@ -18,3 +18,8 @@ tensorboardX
 safetensors
 pyyaml
 datasets<4  # для prepare_test_dataset.py (скачать тестовый датасет с HF)
+
+# Авто-подготовка датасета из видео/аудио (Parakeet TDT 0.6B v3 INT8 ONNX)
+# Сама модель (~670 MB) качается лениво при первом клике на «Авто-подготовку»
+# [gpu,hub] — подтягивает onnxruntime-gpu и huggingface_hub автоматически
+onnx-asr[gpu,hub]>=0.5

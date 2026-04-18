@@ -9,6 +9,16 @@ import os
 import sys
 import asyncio
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+# Windows: форсим UTF-8 stdout/stderr иначе print('❌ ...') ломается
+# с 'charmap' codec can't encode character
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # === Windows retry_open patch для anyio/aiofiles (PermissionError от антивируса) ===
 if sys.platform == "win32":
@@ -281,6 +291,689 @@ def get_training_script() -> Optional[Path]:
     return script if script.exists() else None
 
 
+# ====================================================================
+# === АВТО-ПОДГОТОВКА ДАТАСЕТА (Parakeet TDT 0.6B v3 INT8 ONNX) ====
+# ====================================================================
+
+# Ленивая загрузка Parakeet — модель (~670 MB) качается только когда юзер жмёт «Авто-подготовку»
+_asr_model = None
+
+
+def get_asr_model(language: Optional[str] = None):
+    """Lazy-load Parakeet TDT 0.6B v3 INT8 ONNX + Silero VAD для длинного аудио.
+    Модель скачается в HF cache при первом вызове (~670 MB + ~2 MB VAD).
+    Автоматически использует GPU (CUDA) если доступен, с фоллбеком на CPU."""
+    global _asr_model
+    if _asr_model is not None:
+        return _asr_model
+    print("[asr] Загружаю Parakeet TDT 0.6B v3 INT8 + Silero VAD (при первом запуске ~670 MB)...")
+    import onnx_asr
+
+    # Выбираем best provider: CUDA если есть, иначе CPU
+    providers = []
+    try:
+        import onnxruntime as ort
+        available = ort.get_available_providers()
+        if "CUDAExecutionProvider" in available:
+            providers.append(("CUDAExecutionProvider", {"device_id": 0}))
+            print("[asr] Использую CUDAExecutionProvider")
+        providers.append(("CPUExecutionProvider", {}))
+    except Exception as exc:
+        print(f"[asr] onnxruntime check failed, используем default providers: {exc}")
+        providers = None
+
+    kwargs = {"quantization": "int8"}
+    if providers is not None:
+        kwargs["providers"] = providers
+
+    # Silero VAD для разбиения длинного аудио на речевые сегменты
+    # (Parakeet сам по себе держит только ~20-30 сек за проход)
+    vad = onnx_asr.load_vad("silero", providers=providers if providers else None)
+
+    _asr_model = (
+        onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3", **kwargs)
+        .with_vad(vad)
+        .with_timestamps()
+    )
+    print("[asr] Модель загружена (с VAD для длинного аудио).")
+    return _asr_model
+
+
+def _ffmpeg_bin() -> str:
+    """Путь к ffmpeg: сначала портативный ffmpeg/bin/ffmpeg.exe, иначе системный."""
+    portable = SCRIPT_DIR / "ffmpeg" / "bin" / ("ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
+    if portable.exists():
+        return str(portable)
+    return "ffmpeg"
+
+
+def _ffprobe_duration(path: str) -> float:
+    """Длительность медиафайла в секундах (через ffmpeg -i parse)."""
+    import subprocess, re
+    try:
+        res = subprocess.run(
+            [_ffmpeg_bin(), "-i", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", res.stderr)
+        if m:
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception:
+        pass
+    return 0.0
+
+
+def extract_audio_16k_mono(src_path: str, dst_path: Path) -> bool:
+    """ffmpeg: любой видео/аудио → 16kHz mono WAV. Возвращает True при успехе."""
+    import subprocess
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            [_ffmpeg_bin(), "-y", "-i", src_path,
+             "-vn", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
+             str(dst_path)],
+            check=True, capture_output=True, timeout=3600,
+        )
+        return dst_path.exists() and dst_path.stat().st_size > 0
+    except subprocess.CalledProcessError as exc:
+        print(f"[ffmpeg] extract error: {exc.stderr.decode('utf-8', errors='replace')[:500]}")
+        return False
+    except Exception as exc:
+        print(f"[ffmpeg] extract error: {exc}")
+        return False
+
+
+def _extract_words_from_result(result) -> list[dict]:
+    """Распарсить результат onnx-asr .with_timestamps() в список {text, start, end}.
+
+    Основной формат — TimestampedSegmentResult(start, end, text, timestamps, tokens, logprobs):
+      - tokens — список BPE-субтокенов (строки); начало нового слова обозначается лидирующим пробелом
+      - timestamps[i] — время старта tokens[i] (в секундах, абсолютные от начала поданного аудио)
+
+    Алгоритм: склеиваем подряд идущие субтокены в слова по маркеру-пробелу.
+    Возвращаем [{text, start, end}] на каждое слово.
+    """
+    words = []
+
+    tokens = getattr(result, "tokens", None)
+    timestamps = getattr(result, "timestamps", None)
+    seg_end = float(getattr(result, "end", 0.0) or 0.0)
+
+    # --- Основной путь: TimestampedSegmentResult с параллельными tokens + timestamps ---
+    if tokens is not None and timestamps is not None and len(tokens) == len(timestamps):
+        cur = None
+        for i, (tok, ts) in enumerate(zip(tokens, timestamps)):
+            tok_s = str(tok)
+            next_ts = float(timestamps[i + 1]) if (i + 1) < len(timestamps) else (seg_end or float(ts))
+            is_new_word = tok_s.startswith(" ") or i == 0
+            piece = tok_s.lstrip(" ")
+            if is_new_word:
+                if cur and cur["text"]:
+                    words.append(cur)
+                cur = {"text": piece, "start": float(ts), "end": float(next_ts)}
+            else:
+                if cur is None:
+                    cur = {"text": piece, "start": float(ts), "end": float(next_ts)}
+                else:
+                    cur["text"] += piece
+                    cur["end"] = float(next_ts)
+        if cur and cur["text"]:
+            words.append(cur)
+        return words
+
+    # --- Фоллбек: старые форматы (dict/list/tuple в tokens) ---
+    if tokens is None and isinstance(result, (list, tuple)) and len(result) >= 2:
+        tokens = result[1]
+    if tokens is None:
+        return words
+    for t in tokens:
+        if hasattr(t, "text"):
+            text = (t.text or "").strip()
+            start = float(getattr(t, "start", 0.0))
+            end = float(getattr(t, "end", start))
+        elif isinstance(t, dict):
+            text = (t.get("text") or t.get("word") or "").strip()
+            start = float(t.get("start", 0.0))
+            end = float(t.get("end", start))
+        elif isinstance(t, (list, tuple)) and len(t) >= 3:
+            text = str(t[0]).strip()
+            start = float(t[1])
+            end = float(t[2])
+        else:
+            continue
+        if text:
+            words.append({"text": text, "start": start, "end": end})
+    return words
+
+
+# Пунктуация конца предложения (включая русские/англ/CJK)
+_SENT_END_CHARS = set(".!?…。？！")
+# Мягкие разделители внутри длинного предложения
+_SOFT_SPLIT_CHARS = set(",;：、，；:")
+
+
+def segment_by_sentences(
+    words: list[dict],
+    min_sec: float = 2.0,
+    max_sec: float = 15.0,
+    target_min: float = 4.0,
+    target_max: float = 10.0,
+) -> tuple[list[dict], dict]:
+    """
+    Сгруппировать слова в осмысленные клипы (целые предложения / абзацы).
+    Возвращает (segments, stats).
+
+    stats = {
+      "raw_sentences": int,       # сколько было предложений после парсинга
+      "after_merge": int,         # сколько блоков после склейки коротких
+      "after_split": int,         # сколько блоков после разрезки длинных
+      "kept": int,                # сколько осталось после финальной фильтрации
+      "dropped_too_short": int,   # отброшено за min_sec
+      "dropped_too_long": int,    # отброшено за max_sec (защита от бага split)
+      "dropped_empty": int,       # отброшено без букв/цифр
+      "dropped_sec": float,       # суммарная длительность отброшенного
+    }
+
+    Алгоритм:
+    1) Предложения по `.` `!` `?` `…`
+    2) Жадная склейка коротких: пока cur < target_min — приклеиваем следующее
+       (независимо от паузы, лишь бы итог ≤ max_sec). Для маленьких видео
+       это гарантирует, что ничего не теряем.
+    3) Разрезка длинных (> max_sec) по запятым / паузам
+    4) Фильтр: < min_sec, пустые, > max_sec
+    """
+    stats = {
+        "raw_sentences": 0, "after_merge": 0, "after_split": 0,
+        "kept": 0, "dropped_too_short": 0, "dropped_too_long": 0,
+        "dropped_empty": 0, "dropped_sec": 0.0,
+    }
+    if not words:
+        return [], stats
+
+    # Шаг 1: группируем слова в предложения по терминаторам
+    sentences: list[dict] = []
+    buf: list[dict] = []
+    for w in words:
+        buf.append(w)
+        last = w["text"][-1] if w["text"] else ""
+        if last in _SENT_END_CHARS:
+            sentences.append({
+                "start": buf[0]["start"], "end": buf[-1]["end"],
+                "text": " ".join(x["text"] for x in buf).strip(),
+                "_words": buf,
+            })
+            buf = []
+    if buf:
+        sentences.append({
+            "start": buf[0]["start"], "end": buf[-1]["end"],
+            "text": " ".join(x["text"] for x in buf).strip(),
+            "_words": buf,
+        })
+    stats["raw_sentences"] = len(sentences)
+
+    # Шаг 2: жадная склейка — пока клип < target_min, приклеиваем следующий
+    #         (тут НЕ смотрим на gap — важнее не потерять данные)
+    merged: list[dict] = []
+    i = 0
+    while i < len(sentences):
+        cur = dict(sentences[i])
+        cur_words = list(cur.get("_words", []))
+        dur = cur["end"] - cur["start"]
+        while dur < target_min and (i + 1) < len(sentences):
+            nxt = sentences[i + 1]
+            new_dur = nxt["end"] - cur["start"]
+            if new_dur > max_sec:
+                break  # иначе лопнет и придётся пилить
+            cur["end"] = nxt["end"]
+            cur["text"] = (cur["text"] + " " + nxt["text"]).strip()
+            cur_words.extend(nxt.get("_words", []))
+            dur = cur["end"] - cur["start"]
+            i += 1
+        cur["_words"] = cur_words
+        merged.append(cur)
+        i += 1
+    stats["after_merge"] = len(merged)
+
+    # Шаг 3: режем слишком длинные
+    final: list[dict] = []
+    for s in merged:
+        dur = s["end"] - s["start"]
+        if dur <= max_sec:
+            final.append(s)
+            continue
+        ws = s.get("_words", [])
+        if not ws:
+            final.append(s)
+            continue
+        final.extend(_split_long(ws, target_max=target_max, max_sec=max_sec, min_sec=min_sec))
+    stats["after_split"] = len(final)
+
+    # Шаг 4: финальная фильтрация
+    out: list[dict] = []
+    for s in final:
+        dur = s["end"] - s["start"]
+        if not s["text"] or not any(ch.isalnum() for ch in s["text"]):
+            stats["dropped_empty"] += 1
+            stats["dropped_sec"] += max(dur, 0)
+            continue
+        if dur < min_sec:
+            stats["dropped_too_short"] += 1
+            stats["dropped_sec"] += dur
+            continue
+        if dur > max_sec:
+            stats["dropped_too_long"] += 1
+            stats["dropped_sec"] += dur
+            continue
+        out.append({"start": s["start"], "end": s["end"], "text": s["text"]})
+    stats["kept"] = len(out)
+    return out, stats
+
+
+def _make_segment(ws: list[dict]) -> dict:
+    return {
+        "start": ws[0]["start"],
+        "end": ws[-1]["end"],
+        "text": " ".join(x["text"] for x in ws).strip(),
+        "_words": ws,
+    }
+
+
+def _find_best_cut(ws: list[dict], min_sec: float) -> int:
+    """Найти индекс слова, ПОСЛЕ которого резать. Требования:
+    - обе части должны иметь длительность >= min_sec (сбалансированный шов)
+    - среди таких валидных швов: ближайший к середине
+    - приоритет: запятая/двоеточие → большая пауза → ближайший к середине
+    Возвращает -1 если валидного шва нет (блок некратен).
+    """
+    if len(ws) < 2:
+        return -1
+    total_start = ws[0]["start"]
+    total_end = ws[-1]["end"]
+    mid = len(ws) // 2
+
+    # Фильтруем кандидатов: оба куска должны быть >= min_sec
+    valid = []
+    for i in range(len(ws) - 1):
+        left_dur = ws[i]["end"] - total_start
+        right_dur = total_end - ws[i + 1]["start"]
+        if left_dur >= min_sec and right_dur >= min_sec:
+            valid.append(i)
+    if not valid:
+        return -1
+
+    # Сортируем валидных по удалению от середины
+    valid.sort(key=lambda i: abs(i - (mid - 1)))
+
+    # Проход 1: запятые/двоеточия (первый найденный = ближайший к середине)
+    for i in valid:
+        last = ws[i]["text"][-1] if ws[i]["text"] else ""
+        if last in _SOFT_SPLIT_CHARS:
+            return i
+
+    # Проход 2: большие паузы (>0.2 сек), ближайший к середине
+    for i in valid:
+        gap = ws[i + 1]["start"] - ws[i]["end"]
+        if gap > 0.2:
+            return i
+
+    # Проход 3: просто ближайший к середине валидный шов
+    return valid[0]
+
+
+def _split_long(ws: list[dict], target_max: float, max_sec: float, min_sec: float = 2.0) -> list[dict]:
+    """Рекурсивно резать длинную последовательность слов на части ≤ max_sec.
+    Гарантия: ни одна итоговая часть не превысит max_sec. Может вернуть куски < min_sec
+    (они отфильтруются выше), но суммарно покрывает всё исходное аудио."""
+    if not ws:
+        return []
+    total = ws[-1]["end"] - ws[0]["start"]
+    if total <= max_sec:
+        return [_make_segment(ws)]
+    if len(ws) <= 1:
+        return []  # одно «слово» длиннее max_sec — аномалия ASR, пропускаем
+
+    # Приоритет 1: сбалансированный шов (обе части >= min_sec) по запятой
+    cut = _find_best_cut(ws, min_sec=min_sec)
+
+    # Приоритет 2: если балансированного нет — берём шов, ПОСЛЕ которого
+    # левая часть ближе всего к target_max (но не превышает max_sec)
+    if cut < 0:
+        start_t = ws[0]["start"]
+        best_i = -1
+        best_score = float("inf")
+        for i in range(len(ws) - 1):
+            left_dur = ws[i]["end"] - start_t
+            if left_dur > max_sec:
+                break  # дальше только больше
+            # score: насколько близко левая часть к target_max (но не выше max_sec)
+            score = abs(target_max - left_dur)
+            if score < best_score:
+                best_score = score
+                best_i = i
+        cut = best_i if best_i >= 0 else len(ws) // 2 - 1
+
+    if cut < 0 or cut >= len(ws) - 1:
+        cut = len(ws) // 2 - 1
+
+    left = ws[: cut + 1]
+    right = ws[cut + 1 :]
+
+    out: list[dict] = []
+    out.extend(_split_long(left, target_max=target_max, max_sec=max_sec, min_sec=min_sec))
+    out.extend(_split_long(right, target_max=target_max, max_sec=max_sec, min_sec=min_sec))
+    return out
+
+
+def _pick_grad_accum(n_clips: int) -> int:
+    """Общий выбор grad_accum по размеру датасета (используется и в train_lora, и в recommender)."""
+    if n_clips < 200:
+        return 4
+    if n_clips < 500:
+        return 8
+    return 16
+
+
+def recommend_lora_settings(n_clips: int, total_speech_sec: float) -> tuple[int, int, int, float, str]:
+    """
+    Рекомендации по настройкам LoRA. Шаги считаются через target_epochs × n_clips / eff_batch,
+    чтобы цикл обучения давал реалистичное число эпох (10-20 для малых датасетов),
+    а не 60+ как при слепом копировании YAML-дефолта.
+
+    База (HF карточка VoxCPM2 + YAML voxcpm_finetune_lora.yaml + FAQ):
+    - r/alpha: 32 (официальный дефолт). Для >60 мин — 64.
+    - lr: 1e-4 (5e-5 для 60+ мин).
+    - eff_batch = 1 × grad_accum (grad_accum из `_pick_grad_accum`).
+
+    target_epochs по минутам речи (эмпирика для speaker LoRA):
+    - < 2 мин   → 25
+    - 2-5 мин   → 20
+    - 5-10 мин  → 15  (сладкая зона)
+    - 10-20 мин → 12
+    - 20-60 мин → 8
+    - 60-120    → 5
+    - 120+ мин  → 3
+    """
+    minutes = total_speech_sec / 60.0
+    eff_batch = 1 * _pick_grad_accum(n_clips)  # batch_size=1 хардкод в train_lora
+
+    if minutes < 2:
+        target_epochs = 25; r, a, lr = 32, 32, 1e-4
+        note = f"⚠ очень мало речи ({minutes:.1f} мин) — ниже минимума OpenBMB (5 мин). Качество будет слабым"
+    elif minutes < 5:
+        target_epochs = 20; r, a, lr = 32, 32, 1e-4
+        note = f"минимум для LoRA ({minutes:.1f} мин)"
+    elif minutes < 10:
+        target_epochs = 15; r, a, lr = 32, 32, 1e-4
+        note = f"стандарт speaker cloning ({minutes:.1f} мин)"
+    elif minutes < 20:
+        target_epochs = 12; r, a, lr = 32, 32, 1e-4
+        note = f"средний датасет ({minutes:.1f} мин)"
+    elif minutes < 60:
+        target_epochs = 8; r, a, lr = 32, 32, 1e-4
+        note = f"большой датасет ({minutes:.1f} мин)"
+    elif minutes < 120:
+        target_epochs = 5; r, a, lr = 64, 64, 5e-5
+        note = f"очень большой ({minutes:.1f} мин), r=64, lr снижен"
+    else:
+        target_epochs = 3; r, a, lr = 64, 64, 5e-5
+        note = f"style/lang adaptation ({minutes:.1f} мин), r=64"
+
+    # steps = epochs × n_clips / effective_batch, округляем к кратному 50, минимум 100
+    steps = max(100, int(round(target_epochs * n_clips / max(eff_batch, 1) / 50.0)) * 50)
+    reason = (
+        f"{note} → цель {target_epochs} эпох × {n_clips} клипов / eff_batch={eff_batch} "
+        f"= {steps} шагов"
+    )
+    return r, a, steps, lr, reason
+
+
+def auto_prepare_dataset(
+    name: str,
+    input_file: str,
+    min_sec: float,
+    max_sec: float,
+    target_min: float,
+    target_max: float,
+    start_training: bool,
+    auto_tune: bool,
+    r: int, alpha: int, steps: int, lr: float,
+    progress=gr.Progress(),
+):
+    """
+    Генератор: обрабатывает видео/аудио → клипы + транскрипты → (опц.) старт тренировки LoRA.
+    Yields (log_text, transcripts_text, files_gallery_update) для UI.
+    """
+    import shutil, json, subprocess
+    log = []
+
+    def emit(msg: str):
+        log.append(msg)
+        print(f"[auto] {msg}")
+
+    # --- валидация ---
+    if not name or not name.strip():
+        emit("❌ Укажи имя датасета / LoRA")
+        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+    name = name.strip().replace(" ", "_")
+
+    if not input_file:
+        emit("❌ Загрузи видео или аудио")
+        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    src_path = Path(input_file)
+    if not src_path.exists():
+        emit(f"❌ Файл не найден: {input_file}")
+        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    progress(0.02, desc="Проверка файла...")
+    duration = _ffprobe_duration(str(src_path))
+    emit(f"▶ Входной файл: {src_path.name} ({duration:.1f} сек)")
+    if duration > 0 and duration < min_sec * 3:
+        emit(f"⚠ Файл очень короткий ({duration:.1f} сек). Нужно минимум ~1-2 мин для разумного датасета.")
+
+    ds_dir = TRAIN_DATA_DIR / name
+    audio_dir = ds_dir / "audio"
+    if audio_dir.exists():
+        # Чистим старые клипы (но сохраняем source_info)
+        for f in audio_dir.glob("*.wav"):
+            try: f.unlink()
+            except: pass
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+
+    # --- 1. ffmpeg → 16kHz mono ---
+    progress(0.05, desc="Извлечение аудио (ffmpeg)...")
+    emit("▶ Извлекаю аудио в 16kHz mono WAV...")
+    full_wav = ds_dir / "_full_16k.wav"
+    if not extract_audio_16k_mono(str(src_path), full_wav):
+        emit("❌ ffmpeg не смог извлечь аудио. Проверь формат файла.")
+        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+    emit(f"✓ {full_wav.name} готов")
+    yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+
+    # --- 2. Parakeet ASR с таймстампами ---
+    progress(0.15, desc="Загрузка ASR модели (первый раз ~670 MB)...")
+    emit("▶ Загружаю Parakeet TDT 0.6B v3 INT8 (если первый запуск — качает ~670 MB)...")
+    yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+    try:
+        asr = get_asr_model()
+    except Exception as exc:
+        emit(f"❌ Ошибка загрузки ASR: {exc}")
+        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    progress(0.30, desc="Транскрипция (Parakeet + VAD)...")
+    emit("▶ Запускаю распознавание через VAD (Silero) → Parakeet посегментно...")
+    yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+    try:
+        result_iter = asr.recognize(str(full_wav))
+    except Exception as exc:
+        emit(f"❌ Ошибка распознавания: {exc}")
+        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    # VAD-driven: один VAD-сегмент = один клип (если > max_sec, режем по внутренним словам)
+    segments = []
+    vad_seg_count = 0
+    try:
+        for seg in result_iter:
+            vad_seg_count += 1
+            seg_start = float(getattr(seg, "start", 0.0) or 0.0)
+            seg_end = float(getattr(seg, "end", seg_start))
+            seg_text = (getattr(seg, "text", "") or "").strip()
+            seg_dur = seg_end - seg_start
+            if not seg_text or not any(c.isalnum() for c in seg_text):
+                continue
+            # Убираем мусорные токены <unk>
+            seg_text = seg_text.replace("<unk>", "").replace("  ", " ").strip()
+            if not seg_text:
+                continue
+
+            if seg_dur <= max_sec:
+                # VAD-сегмент целиком — это 1 клип
+                segments.append({"start": seg_start, "end": seg_end, "text": seg_text})
+            else:
+                # Длинный VAD-сегмент — режем по внутренним словам (предложениям)
+                seg_words = _extract_words_from_result(seg)
+                if not seg_words:
+                    continue
+                sub_segs, _ = segment_by_sentences(
+                    seg_words,
+                    min_sec=min_sec, max_sec=max_sec,
+                    target_min=target_min, target_max=target_max,
+                )
+                segments.extend(sub_segs)
+    except Exception as exc:
+        emit(f"❌ Ошибка разбора результата: {exc}")
+        import traceback; traceback.print_exc()
+        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    if not segments:
+        emit("❌ Не удалось получить валидных сегментов")
+        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    seg_total = sum(s['end'] - s['start'] for s in segments)
+    vad_coverage_pct = seg_total / max(duration, 1) * 100
+    emit(f"✓ {len(segments)} клипов, чистой речи {seg_total:.1f} сек ({vad_coverage_pct:.0f}% от входа)")
+
+    # --- 3. Финальная фильтрация (min_sec) ---
+    progress(0.70, desc="Фильтрация коротких...")
+    before = len(segments)
+    segments = [s for s in segments if (s["end"] - s["start"]) >= min_sec]
+    if before != len(segments):
+        emit(f"  (отброшено {before - len(segments)} клипов короче {min_sec:.1f} сек)")
+    yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+
+    # --- 4. Резка WAV + сохранение ---
+    progress(0.80, desc="Сохранение клипов...")
+    emit("▶ Сохраняю клипы и транскрипты...")
+    wav, sr = sf.read(str(full_wav))
+    if wav.ndim > 1:
+        wav = wav[:, 0]
+
+    transcripts_lines = []
+    saved_paths = []
+    saved_durations = []
+    skipped = 0
+    # Паддинг по краям — 100 мс с каждой стороны чтобы не обрезать хвост последней фонемы
+    # и чуть-чуть «продышать» клип (VoxCPM лучше тренируется на клипах с естественными краями)
+    PAD_SEC = 0.10
+    for idx, seg in enumerate(segments):
+        s_sample = max(0, int((seg["start"] - PAD_SEC) * sr))
+        e_sample = min(len(wav), int((seg["end"] + PAD_SEC) * sr))
+        clip = wav[s_sample:e_sample]
+        dur = len(clip) / sr if sr else 0
+        if dur < min_sec:
+            skipped += 1
+            continue
+        fname = f"clip_{idx:04d}.wav"
+        out_path = audio_dir / fname
+        sf.write(str(out_path), clip, sr)
+        transcripts_lines.append(f"{fname}|{seg['text']}")
+        saved_paths.append(str(out_path))
+        saved_durations.append(dur)
+
+    if not saved_paths:
+        emit("❌ Все клипы оказались слишком короткими")
+        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    transcripts_text = "\n".join(transcripts_lines)
+    (ds_dir / "transcripts.txt").write_text(transcripts_text, encoding="utf-8")
+
+    # Чистая речь = сумма длительностей сохранённых клипов (после сегментации и фильтрации)
+    total_dur = sum(saved_durations)
+    emit(f"✓ Сохранено {len(saved_paths)} клипов, чистой речи {total_dur:.1f} сек ({total_dur/60:.1f} мин)")
+    if skipped:
+        emit(f"  (отброшено {skipped} коротких после обрезки тишины)")
+
+    # Удаляем промежуточный full wav
+    try: full_wav.unlink()
+    except: pass
+
+    # Сохраняем source_info
+    try:
+        (ds_dir / "source_info.json").write_text(json.dumps({
+            "source": str(src_path),
+            "source_duration_sec": duration,
+            "clips": len(saved_paths),
+            "total_speech_sec": total_dur,
+            "skipped_short": skipped,
+            "params": {
+                "min_sec": min_sec, "max_sec": max_sec,
+                "target_min": target_min, "target_max": target_max,
+            },
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    progress(0.95, desc="Готово")
+    emit(f"\n✅ Датасет готов: train_data/{name}/")
+    emit(f"   Транскрипты: train_data/{name}/transcripts.txt")
+    emit(f"   Аудио: train_data/{name}/audio/*.wav")
+
+    # --- Авто-тюнинг настроек LoRA на основе размера датасета ---
+    if auto_tune:
+        ar, aa, asteps, alr, reason = recommend_lora_settings(len(saved_paths), total_dur)
+        emit(f"\n📊 Авто-тюнинг настроек LoRA:")
+        emit(f"   {reason}")
+        emit(f"   → r={ar}, α={aa}, steps={asteps}, lr={alr}")
+        emit("   (отключи галочку «Авто-тюнинг» если хочешь свои значения из слайдеров выше)")
+        r, alpha, steps, lr = ar, aa, asteps, alr
+    else:
+        emit(f"\nℹ Авто-тюнинг выключен — используются значения слайдеров: r={r}, α={alpha}, steps={steps}, lr={lr}")
+
+    if start_training:
+        emit("\n🎓 Галочка «Запустить обучение» стоит — обучение стартует сразу после. Смотри «Лог тренировки» ниже.")
+    else:
+        emit("\nℹ Переключись на вкладку «Ручное обучение» — там файлы и транскрипты уже заполнены, жми «Начать обучение» когда готов.")
+    yield (
+        "\n".join(log), transcripts_text, saved_paths,
+        gr.update(value=r), gr.update(value=alpha),
+        gr.update(value=steps), gr.update(value=lr),
+    )
+
+
+def maybe_auto_train(
+    start_training: bool,
+    name: str, files, transcripts: str,
+    r: int, alpha: int, steps: int, lr: float,
+    progress=gr.Progress(),
+):
+    """Отдельный процесс тренировки. Запускается через .then() после auto_prepare_dataset.
+    Если галочка «запустить после подготовки» не стояла — мгновенно выходит."""
+    if not start_training:
+        return
+    for line in train_lora(name, files, transcripts, r, alpha, steps, lr, progress=progress):
+        yield line
+
+
 def prepare_train_data(name: str, files: list, transcripts_text: str) -> tuple[Path, int]:
     """
     Подготовить датасет для обучения:
@@ -348,7 +1041,16 @@ def train_lora(name, files, transcripts, r, alpha, steps, lr, progress=gr.Progre
     yield f"✓ Dataset: {n} сэмплов → {manifest}"
 
     save_path = LORA_DIR / name
-    save_path.mkdir(exist_ok=True)
+    # Если папка уже существует — чистим (иначе train-скрипт пытается возобновиться
+    # со старого чекпоинта, а если r/alpha изменились, ловим size mismatch)
+    if save_path.exists():
+        import shutil
+        try:
+            shutil.rmtree(save_path)
+            yield f"🧹 Очистил старый чекпоинт {save_path}"
+        except Exception as exc:
+            yield f"⚠ Не смог удалить {save_path}: {exc}"
+    save_path.mkdir(parents=True, exist_ok=True)
     config_path = TRAIN_DATA_DIR / name / "train_config.yaml"
 
     # Путь к уже скачанному VoxCPM2 (в models/ через HF cache)
@@ -359,13 +1061,17 @@ def train_lora(name, files, transcripts, r, alpha, steps, lr, progress=gr.Progre
     except Exception:
         pretrained = snapshot_download("openbmb/VoxCPM2")
 
+    # grad_accum адаптивный (общий для recommender и трена)
+    n_files_for_config = len(files) if files else 20
+    grad_accum = _pick_grad_accum(n_files_for_config)
+
     cfg = {
         "pretrained_path": pretrained,
         "train_manifest": str(manifest),
         "sample_rate": 16000,  # AudioVAE encodes 16kHz (issue #202 fix)
         "out_sample_rate": 48000,
         "batch_size": 1,
-        "grad_accum_steps": 16,
+        "grad_accum_steps": grad_accum,
         "num_workers": 0,
         "num_iters": int(steps),
         "log_interval": 10,
@@ -394,9 +1100,11 @@ def train_lora(name, files, transcripts, r, alpha, steps, lr, progress=gr.Progre
 
     progress(0.15, desc="Старт тренировки...")
 
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    # PYTHONUNBUFFERED=1 + -u = принудительный flush после каждой строки,
+    # иначе Python subprocess буферит stdout при пайпе и UI не видит прогресс
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
     proc = subprocess.Popen(
-        [sys.executable, str(train_script), "--config_path", str(config_path)],
+        [sys.executable, "-u", str(train_script), "--config_path", str(config_path)],
         cwd=str(TRAINING_DIR),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         env=env, text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -767,8 +1475,16 @@ _CSS = """
 .brand-title { font-size: 1.9em; font-weight: 700; margin: 0 0 6px 0; }
 .brand-subtitle { font-size: 1em; opacity: 0.9; margin-bottom: 14px; }
 .brand-credits { font-size: 0.9em; opacity: 0.95; }
-.brand-credits a { color: #fbbf24; text-decoration: none; font-weight: 600; }
-.brand-credits a:hover { text-decoration: underline; }
+.brand-credits a {
+  color: #fbbf24 !important;
+  text-decoration: none !important;
+  font-weight: 600 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  background: none !important;
+  display: inline !important;
+}
+.brand-credits a:hover { text-decoration: underline !important; }
 .device-badge {
   display: inline-block;
   background: rgba(255,255,255,0.15);
@@ -811,8 +1527,17 @@ _CSS = """
   font-size: 0.82em;
   text-decoration: none !important;
   font-weight: 600;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  line-height: 1;
+  white-space: nowrap;
+  min-width: 44px;
 }
 .lang-btn:hover { background: rgba(255,255,255,0.3); }
+.lang-btn img { margin: 0 !important; vertical-align: middle !important; }
 .brand-header { position: relative; }
 
 button.primary {
@@ -821,6 +1546,7 @@ button.primary {
   font-weight: 600 !important;
   border-radius: 10px !important;
 }
+
 .lora-refresh-btn {
   max-width: 44px !important;
   flex: 0 0 44px !important;
@@ -830,6 +1556,85 @@ button.primary {
   min-width: 0 !important;
   width: 44px !important;
   height: 100% !important;
+}
+/* === Donate dropdown next to lang switcher === */
+.donate-wrap {
+  position: relative;
+  display: inline-block;
+}
+.donate-wrap > summary.donate-btn {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  user-select: none;
+}
+.donate-wrap > summary.donate-btn::-webkit-details-marker { display: none; }
+.donate-wrap:not([open]) .donate-popover { display: none !important; pointer-events: none; }
+.donate-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  background: rgba(20, 20, 28, 0.98);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 10px;
+  padding: 10px 14px;
+  min-width: 320px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  z-index: 999;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.donate-popover a {
+  color: #c4a3ff !important;
+  text-decoration: none !important;
+  font-weight: 600 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  background: none !important;
+  display: inline !important;
+}
+.donate-popover a:hover { text-decoration: underline !important; }
+.donate-intro a { color: #c4a3ff !important; }
+.donate-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+}
+.donate-row > span {
+  color: #9ca3af;
+  font-weight: 600;
+  font-size: 12px;
+  flex: 0 0 80px;
+  text-align: left;
+  white-space: nowrap;
+}
+.donate-row > code {
+  flex: 1;
+  text-align: left;
+}
+.donate-row > code {
+  background: rgba(255,255,255,0.06);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #e5e7eb;
+  user-select: all;
+}
+.donate-intro {
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0 0 4px 0;
+}
+.donate-sep {
+  height: 1px;
+  background: rgba(255,255,255,0.1);
+  margin: 6px 0;
 }
 """
 
@@ -844,7 +1649,50 @@ _HEAD_JS = """
 }
 """
 
-def _brand_html(subtitle: str, credits_label: str) -> str:
+_DONATE_POPOVER_RU = """
+<div class="donate-popover">
+  <p class="donate-intro">Привет! Я Илья (<a href="https://t.me/nerual_dreming" target="_blank">Nerual Dreming</a>), я создаю AI-инструменты, которые работают локально — бесплатно, без облака, без подписок. Ваш донат позволяет фокусироваться на исследовании и создании новых открытых проектов, а не на выживании. Спасибо!</p>
+  <div class="donate-sep"></div>
+  <div class="donate-row"><a href="https://dalink.to/nerual_dreming" target="_blank">💳 Карта / PayPal (рубли, доллары, евро)</a></div>
+  <div class="donate-row"><a href="https://boosty.to/neuro_art" target="_blank">🚀 Ежемесячная подписка на Boosty</a></div>
+  <div class="donate-sep"></div>
+  <div class="donate-row"><span>BTC</span><code>1E7dHL22RpyhJGVpcvKdbyZgksSYkYeEBC</code></div>
+  <div class="donate-row"><span>ETH</span><code>0xb5db65adf478983186d4897ba92fe2c25c594a0c</code></div>
+  <div class="donate-row"><span>USDT TRC20</span><code>TQST9Lp2TjK6FiVkn4fwfGUee7NmkxEE7C</code></div>
+</div>
+"""
+
+_DONATE_POPOVER_EN = """
+<div class="donate-popover">
+  <p class="donate-intro">Hi! I'm Ilya (<a href="https://t.me/nerual_dreming" target="_blank">Nerual Dreming</a>), I build AI tools that anyone can run locally — for free, without cloud, without subscriptions. Your donation lets me focus on research and building new open-source projects instead of surviving. Thank you!</p>
+  <div class="donate-sep"></div>
+  <div class="donate-row"><a href="https://dalink.to/nerual_dreming" target="_blank">💳 Card / PayPal (USD, EUR, RUB)</a></div>
+  <div class="donate-row"><a href="https://boosty.to/neuro_art" target="_blank">🚀 Monthly subscription on Boosty</a></div>
+  <div class="donate-sep"></div>
+  <div class="donate-row"><span>BTC</span><code>1E7dHL22RpyhJGVpcvKdbyZgksSYkYeEBC</code></div>
+  <div class="donate-row"><span>ETH</span><code>0xb5db65adf478983186d4897ba92fe2c25c594a0c</code></div>
+  <div class="donate-row"><span>USDT TRC20</span><code>TQST9Lp2TjK6FiVkn4fwfGUee7NmkxEE7C</code></div>
+</div>
+"""
+
+
+_CREDITS_HTML_RU = (
+    'Собрал <a href="https://t.me/nerual_dreming" target="_blank">Nerual Dreming</a> — '
+    'основатель <a href="https://artgeneration.me" target="_blank">ArtGeneration.me</a>, '
+    'техноблогер и нейро-евангелист. '
+    'Канал <a href="https://t.me/neuroport" target="_blank">Нейро-Софт</a> — '
+    'репаки и портативки полезных нейросетей.'
+)
+_CREDITS_HTML_EN = (
+    'Built by <a href="https://t.me/nerual_dreming" target="_blank">Nerual Dreming</a> — '
+    'founder of <a href="https://artgeneration.me" target="_blank">ArtGeneration.me</a>, '
+    'tech-blogger and neuro-evangelist. '
+    'Channel <a href="https://t.me/neuroport" target="_blank">Нейро-Софт</a> — '
+    'portable builds of useful AI tools.'
+)
+
+
+def _brand_html(subtitle: str, credits_label: str, donate_title: str = "Поддержать проект", donate_popover: str = _DONATE_POPOVER_RU, donate_label: str = "Донат", credits_html: str = _CREDITS_HTML_RU) -> str:
     return f"""
 <div class="brand-header">
   <div class="lang-switcher">
@@ -854,14 +1702,15 @@ def _brand_html(subtitle: str, credits_label: str) -> str:
     <a href="?__lang=en&__theme=dark" class="lang-btn">
       <img src="https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/1f1ec-1f1e7.svg" width="16" height="16" style="vertical-align:-3px;margin-right:4px"/>EN
     </a>
+    <details class="donate-wrap">
+      <summary class="lang-btn donate-btn" title="{donate_title}"><img src="https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/1fa99.svg" width="16" height="16"/>{donate_label}</summary>
+      {donate_popover}
+    </details>
   </div>
   <div class="brand-title">🎙️ VoxCPM2 — Multilingual TTS</div>
   <div class="brand-subtitle">{subtitle}</div>
   <div class="brand-credits">
-    {credits_label}:
-    <a href="https://t.me/nerual_dreming" target="_blank">Nerual Dreming</a> ·
-    <a href="https://neuro-cartel.com" target="_blank">neuro-cartel.com</a> ·
-    <a href="https://t.me/neuroport" target="_blank">Нейро-Софт</a>
+    {credits_html}
   </div>
   <div class="device-badge">💻 {DEVICE_INFO}</div>
 </div>
@@ -870,18 +1719,38 @@ def _brand_html(subtitle: str, credits_label: str) -> str:
 _BRAND_HTML_RU = _brand_html(
     "2B параметров · 30 языков · 48 kHz · Voice Design &amp; Cloning",
     "Портативная сборка",
+    donate_title="Поддержать проект",
+    donate_popover=_DONATE_POPOVER_RU,
+    donate_label="Донат",
+    credits_html=_CREDITS_HTML_RU,
 )
 _BRAND_HTML_EN = _brand_html(
     "2B parameters · 30 languages · 48 kHz · Voice Design &amp; Cloning",
     "Portable build",
+    donate_title="Support the project",
+    donate_popover=_DONATE_POPOVER_EN,
+    donate_label="Donate",
+    credits_html=_CREDITS_HTML_EN,
 )
 
 
 # === UI Builder ===
 def _seed_row(prefix: str):
-    with gr.Row():
-        seed = gr.Number(value=-1, label=I18N("label_seed"), precision=0, scale=3, elem_id=f"{prefix}_seed")
-        locked = gr.Checkbox(value=False, label=I18N("label_lock"), scale=1, elem_id=f"{prefix}_locked")
+    # Аналогично LoRA-ряду: label выносится в Markdown над Row,
+    # а Number внутри ряда идёт без собственного label (show_label=False, container=False)
+    # — тогда Number и Checkbox становятся одинаковой высоты и чекбокс встаёт на уровне input'а
+    gr.Markdown(f"**{I18N('label_seed')}**")
+    with gr.Row(equal_height=True):
+        seed = gr.Number(
+            value=-1, show_label=False, precision=0,
+            scale=20, min_width=200, container=False,
+            elem_id=f"{prefix}_seed",
+        )
+        locked = gr.Checkbox(
+            value=False, label=I18N("label_lock"),
+            scale=0, min_width=220,
+            elem_id=f"{prefix}_locked",
+        )
     return seed, locked
 
 
@@ -976,7 +1845,70 @@ I18N = gr.I18n(
         "label_streaming": "Streaming mode (live progress)",
         "tab_lora": "LoRA",
         "lora_attach_title": "🔌 Attach trained LoRA",
-        "lora_train_title": "🎓 Train new LoRA",
+        "lora_train_title": "🎓 Train new LoRA (manual)",
+        "lora_auto_title": "🎬 Auto-prepare dataset from video/audio",
+        "lora_auto_desc": "Upload a long video/audio file — it will be automatically split into meaningful clips (whole sentences/paragraphs), transcribed via Parakeet TDT 0.6B v3 INT8 (~670 MB, downloads on first use), and (optionally) used to train a LoRA.",
+        "lora_auto_file": "Video or audio file",
+        "lora_auto_name": "Dataset / LoRA name",
+        "lora_auto_min_sec": "Min clip (sec)",
+        "lora_auto_max_sec": "Max clip (sec)",
+        "lora_auto_target_min": "Target min (sec)",
+        "lora_auto_target_max": "Target max (sec)",
+        "lora_auto_params": "Segmentation parameters",
+        "lora_auto_start_training": "Start training after dataset is ready",
+        "lora_auto_tune": "🤖 Auto-tune LoRA settings (r, α, steps, lr) by dataset size",
+        "lora_auto_btn": "🎬 Auto-prepare",
+        "lora_auto_log": "Auto-prep log",
+        "lora_auto_how_title": "How does this work?",
+        "lora_auto_how_desc": (
+            "**Pipeline:**\n\n"
+            "1. **ffmpeg** extracts the audio track and converts it to 16 kHz mono WAV\n"
+            "2. **Parakeet TDT 0.6B v3 INT8** (NVIDIA NeMo, 25 European languages incl. Russian) "
+            "transcribes everything in one pass with word-level timestamps. The model downloads once (~670 MB) "
+            "into the HuggingFace cache and runs on GPU if CUDA is available\n"
+            "3. Words are grouped into **whole sentences** by punctuation (`.` `!` `?` `…`)\n"
+            "4. Short neighbouring sentences (< target min) are glued together into meaningful paragraphs "
+            "if the pause between them is under 0.5 s\n"
+            "5. Overly long sentences (> max sec) are split at commas / semicolons / long pauses — never mid-word\n"
+            "6. Each clip is cut straight by word-level timestamps from Parakeet (+100 ms padding at the edges) — no silence-trim hacks\n"
+            "7. If **Auto-tune** is ON — `r / α / steps / lr` are chosen automatically from the clip count "
+            "(based on OpenBMB's official table, e.g. 10-20 clips → `r=16, steps=500`; 100+ clips → `r=32, steps=2000`)\n\n"
+            "**What you get:** `train_data/<name>/audio/clip_NNNN.wav` + `transcripts.txt` — ready for LoRA training. "
+            "If the checkbox is on, training starts immediately after preparation."
+        ),
+        "lora_manual_desc": "Prepare the dataset manually: upload 5-50 audio files (wav/mp3/flac, 3-15 sec each). Below, provide transcripts line by line in the format `filename.wav|exact text`.\n\n**Minimum**: 5-10 minutes of audio. Optimal — clean recording of a single speaker.",
+        # --- UI labels (was hardcoded) ---
+        "label_examples": "Examples",
+        "label_audio_files": "Audio files (wav/mp3/flac/m4a)",
+        "label_transcripts": "Transcripts (format: filename|text)",
+        "label_lora_r": "LoRA rank (r)",
+        "label_lora_alpha": "LoRA alpha",
+        "label_lora_steps": "Training steps",
+        "label_lora_lr": "Learning rate",
+        "label_train_log": "Training log",
+        "btn_train_start": "🎓 Start training",
+        "lora_name_info": "Used for both dataset folder (train_data/<name>/) and LoRA folder (lora/<name>/)",
+        # --- Placeholders ---
+        "ph_tts_text": "Enter text in any of 30 supported languages...",
+        "ph_design_desc": "e.g. A young woman with a soft gentle voice",
+        "ph_design_text": "Hello, welcome to VoxCPM2!",
+        "ph_clone_transcript": "Exact text of what is spoken in the reference audio",
+        "ph_clone_style": "e.g. slightly faster, cheerful tone",
+        "ph_transcripts": "clip_001.wav|Hello, my name is Ivan.\nclip_002.wav|Today is a beautiful day.",
+        # --- Info hints ---
+        "info_auto_min_sec": "Shorter clips are dropped",
+        "info_auto_max_sec": "VoxCPM dislikes clips longer than 15 sec",
+        "info_auto_target_min": "Short sentences get merged",
+        "info_auto_target_max": "Long ones split by commas/pauses",
+        "info_auto_tune": "Auto-picks r / alpha / steps / lr based on dataset size (OpenBMB docs table)",
+        "info_lora_r": "OpenBMB default is 32 (for 2-60 min speech). Use 64 for 60+ min / new language",
+        "info_lora_alpha": "Usually = r (OpenBMB YAML: 32)",
+        "info_lora_steps": "OpenBMB default: 1000 (for 5-10 min). 2000 for full convergence (FAQ)",
+        "info_lora_lr": "0.0001 standard (lower to 5e-5 for 60+ min)",
+        "md_step2_note": "In **🎬 Auto** mode with **Auto-tune** on, these sliders are **ignored** — settings are picked from minutes of speech (OpenBMB table). Otherwise the values below are used.",
+        "md_step1_title": "📁 Step 1 · Dataset preparation",
+        "md_step2_title": "🎓 Step 2 · LoRA training settings",
+        "label_status": "Status",
     },
     ru={
         "tab_tts": "Текст в речь",
@@ -1024,7 +1956,72 @@ I18N = gr.I18n(
         "label_streaming": "Потоковая генерация (live)",
         "tab_lora": "LoRA",
         "lora_attach_title": "🔌 Подключить готовую LoRA",
-        "lora_train_title": "🎓 Обучить новую LoRA",
+        "lora_train_title": "🎓 Обучить новую LoRA (ручной режим)",
+        "lora_auto_title": "🎬 Авто-подготовка датасета из видео/аудио",
+        "lora_auto_desc": "Загрузи длинное видео или аудио — программа автоматически нарежет его на осмысленные куски (целые предложения / абзацы), распознает через Parakeet TDT 0.6B v3 INT8 (~670 MB, скачается при первом использовании) и (опционально) сразу запустит обучение LoRA.",
+        "lora_auto_file": "Видео или аудио",
+        "lora_auto_name": "Имя датасета / LoRA",
+        "lora_auto_min_sec": "Мин клип (сек)",
+        "lora_auto_max_sec": "Макс клип (сек)",
+        "lora_auto_target_min": "Целевой min (сек)",
+        "lora_auto_target_max": "Целевой max (сек)",
+        "lora_auto_params": "Параметры нарезки",
+        "lora_auto_start_training": "Запустить обучение после подготовки датасета",
+        "lora_auto_tune": "🤖 Авто-тюнинг настроек LoRA (r, α, steps, lr) по размеру датасета",
+        "lora_auto_btn": "🎬 Авто-подготовка",
+        "lora_auto_log": "Лог авто-подготовки",
+        "lora_auto_how_title": "Как это работает?",
+        "lora_auto_how_desc": (
+            "**Пайплайн:**\n\n"
+            "1. **ffmpeg** извлекает аудио-дорожку и конвертирует в 16 kHz mono WAV\n"
+            "2. **Parakeet TDT 0.6B v3 INT8** (NVIDIA NeMo, 25 европейских языков включая русский) "
+            "транскрибирует всё за один проход, выдавая таймстампы каждого слова. Модель скачается при "
+            "первом запуске (~670 MB) в HF cache и использует GPU если CUDA доступна\n"
+            "3. Слова группируются в **целые предложения** по пунктуации (`.` `!` `?` `…`)\n"
+            "4. Короткие соседние предложения (< целевой min) склеиваются в осмысленные абзацы, "
+            "если пауза между ними меньше 0.5 сек\n"
+            "5. Слишком длинные предложения (> max sec) режутся по запятым / точкам с запятой / "
+            "длинным паузам — никогда не посреди слова\n"
+            "6. Клипы режутся ровно по word-timestamps от Parakeet (+100 мс паддинг по краям, чтобы не обрезать хвост фонемы) — без костылей с VAD/librosa\n"
+            "7. Если **Авто-тюнинг** включён — `r / α / steps / lr` подбираются автоматически по "
+            "количеству клипов (по официальной таблице OpenBMB, например 10-20 клипов → `r=16, steps=500`; "
+            "100+ клипов → `r=32, steps=2000`)\n\n"
+            "**Что получаешь:** `train_data/<name>/audio/clip_NNNN.wav` + `transcripts.txt` — готово к "
+            "обучению LoRA. Если галочка стоит — обучение стартует сразу после подготовки."
+        ),
+        "lora_manual_desc": "Подготовьте датасет вручную: загрузите 5-50 аудио (wav/mp3/flac, 3-15 сек каждое). Ниже постройте транскрипты в формате: `имя_файла.wav|точный текст`.\n\n**Минимум**: 5-10 минут аудио. Оптимально — чистая запись одного голоса.",
+        # --- UI labels ---
+        "label_examples": "Примеры",
+        "label_audio_files": "Аудиофайлы (wav/mp3/flac/m4a)",
+        "label_transcripts": "Транскрипты (формат: имя_файла|текст)",
+        "label_lora_r": "LoRA ранг (r)",
+        "label_lora_alpha": "LoRA alpha",
+        "label_lora_steps": "Шагов обучения",
+        "label_lora_lr": "Learning rate",
+        "label_train_log": "Лог тренировки",
+        "btn_train_start": "🎓 Начать обучение",
+        "lora_name_info": "Используется и для папки датасета (train_data/<имя>/), и для папки LoRA (lora/<имя>/)",
+        # --- Placeholders ---
+        "ph_tts_text": "Введите текст на любом из 30 поддерживаемых языков...",
+        "ph_design_desc": "например: Молодая женщина, нежный и мягкий голос",
+        "ph_design_text": "Привет, добро пожаловать в VoxCPM2!",
+        "ph_clone_transcript": "Точный текст того что говорится в референс-аудио",
+        "ph_clone_style": "например: чуть быстрее, бодрым тоном",
+        "ph_transcripts": "clip_001.wav|Здравствуйте, меня зовут Иван.\nclip_002.wav|Сегодня отличная погода.",
+        # --- Info hints ---
+        "info_auto_min_sec": "Клипы короче отбрасываются",
+        "info_auto_max_sec": "VoxCPM не любит клипы длиннее 15 сек",
+        "info_auto_target_min": "Короткие предложения склеиваются",
+        "info_auto_target_max": "Длинные режутся по запятым/паузам",
+        "info_auto_tune": "Автоматически подбирает r / alpha / steps / lr по количеству клипов (таблица из доков OpenBMB)",
+        "info_lora_r": "Официальный дефолт OpenBMB — 32 (для 2-60 мин речи). 64 для 60+ мин / смены языка",
+        "info_lora_alpha": "Обычно = r (по YAML OpenBMB: 32)",
+        "info_lora_steps": "Официальный дефолт: 1000 (для 5-10 мин). 2000 для полной сходимости (FAQ OpenBMB)",
+        "info_lora_lr": "0.0001 стандарт (снизь до 5e-5 для 60+ мин)",
+        "md_step2_note": "В режиме **🎬 Авто** с включённой галочкой «Авто-тюнинг» эти слайдеры **игнорируются** — параметры подбираются автоматически по количеству минут речи (таблица OpenBMB). В остальных случаях используются значения ниже.",
+        "md_step1_title": "📁 Шаг 1 · Подготовка датасета",
+        "md_step2_title": "🎓 Шаг 2 · Настройки обучения LoRA",
+        "label_status": "Статус",
     },
 )
 
@@ -1038,8 +2035,42 @@ _HEAD_SCRIPT = """
     if (lang) {
       Object.defineProperty(navigator, 'language', {value: lang, configurable: true});
       Object.defineProperty(navigator, 'languages', {value: [lang], configurable: true});
+      document.documentElement.lang = lang;
     }
   } catch(e) {}
+
+  // После загрузки Gradio — находим i18n модуль и принудительно выставляем локаль
+  // (override navigator.language через Object.defineProperty ненадёжен в Gradio 6.10,
+  // поэтому вызываем changeLocale напрямую — несколько раз с задержкой,
+  // чтобы все табы/компоненты успели перемонтироваться)
+  function applyLang() {
+    try {
+      var u = new URL(window.location);
+      var lang = u.searchParams.get('__lang');
+      if (!lang) return;
+      var linkEl = document.querySelector('link[href*="i18n-"][rel*="preload"]');
+      if (!linkEl) { setTimeout(applyLang, 200); return; }
+      import(linkEl.href).then(function(mod){
+        if (!mod || typeof mod.J !== 'function') return;
+        var trigger = function() {
+          try {
+            mod.J(lang);
+            window.dispatchEvent(new Event('languagechange'));
+          } catch(e) {}
+        };
+        // Мульти-проход: немедленно, через 300мс, 1сек, 2сек — чтобы поймать все lazy-mount компоненты (табы)
+        trigger();
+        setTimeout(trigger, 300);
+        setTimeout(trigger, 1000);
+        setTimeout(trigger, 2000);
+      }).catch(function(){});
+    } catch(e) {}
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function(){ setTimeout(applyLang, 100); });
+  } else {
+    setTimeout(applyLang, 100);
+  }
 })();
 </script>
 """
@@ -1049,6 +2080,7 @@ def build_ui():
     # Gradio 6.10: theme/css/head passed to launch(), not Blocks()
     with gr.Blocks(
         title="VoxCPM2 — Multilingual TTS",
+        head=_HEAD_SCRIPT,
         delete_cache=(300, 3600),
     ) as demo:
         gr.HTML(I18N("brand_header_html"))
@@ -1058,13 +2090,13 @@ def build_ui():
             gr.Markdown(I18N("tts_instructions"))
             with gr.Row(equal_height=False):
                 with gr.Column(scale=1):
-                    tts_text = gr.Textbox(label=I18N("label_text"), placeholder="Введите текст на любом из 30 поддерживаемых языков...", lines=4)
+                    tts_text = gr.Textbox(label=I18N("label_text"), placeholder=I18N("ph_tts_text"), lines=4)
                     tts_cfg, tts_steps, tts_fmt, tts_norm, tts_retry, tts_retry_max, tts_retry_ratio, tts_min_len, tts_max_len, tts_stream, _ = _advanced_block("tts", show_denoise=False)
                     tts_seed, tts_locked = _seed_row("tts")
                     tts_btn = gr.Button(I18N("btn_tts"), variant="primary", size="lg")
                 with gr.Column(scale=1):
-                    tts_out = gr.Audio(label=I18N("label_output"), type="filepath")
-            gr.Examples(examples=TTS_EXAMPLES, inputs=[tts_text], label="Примеры / Examples", examples_per_page=10)
+                    tts_out = gr.Audio(label=I18N("label_output"), type="filepath", autoplay=True)
+            gr.Examples(examples=TTS_EXAMPLES, inputs=[tts_text], label=I18N("label_examples"), examples_per_page=10)
             tts_btn.click(
                 tts_generate,
                 inputs=[tts_text, tts_cfg, tts_steps, tts_fmt, tts_retry_max, tts_retry_ratio, tts_min_len, tts_max_len, tts_stream, tts_seed, tts_locked, tts_norm, tts_retry],
@@ -1076,13 +2108,13 @@ def build_ui():
             gr.Markdown(I18N("design_instructions"))
             with gr.Row(equal_height=False):
                 with gr.Column(scale=1):
-                    vd_desc = gr.Textbox(label=I18N("label_description"), placeholder="например: Молодая женщина, нежный и мягкий голос", lines=2)
-                    vd_text = gr.Textbox(label=I18N("label_content"), placeholder="Привет, добро пожаловать в VoxCPM2!", lines=3)
+                    vd_desc = gr.Textbox(label=I18N("label_description"), placeholder=I18N("ph_design_desc"), lines=2)
+                    vd_text = gr.Textbox(label=I18N("label_content"), placeholder=I18N("ph_design_text"), lines=3)
                     vd_cfg, vd_steps, vd_fmt, vd_norm, vd_retry, vd_retry_max, vd_retry_ratio, vd_min_len, vd_max_len, vd_stream, _ = _advanced_block("vd", show_denoise=False)
                     vd_seed, vd_locked = _seed_row("vd")
                     vd_btn = gr.Button(I18N("btn_design"), variant="primary", size="lg")
                 with gr.Column(scale=1):
-                    vd_out = gr.Audio(label=I18N("label_output"), type="filepath")
+                    vd_out = gr.Audio(label=I18N("label_output"), type="filepath", autoplay=True)
             # Voice Design examples — кнопки, заполняющие оба поля (gr.Examples не резолвит gr.I18n в заголовках)
             gr.Markdown("**Примеры описаний голоса / Voice design examples** (кликни, чтобы подставить):")
             with gr.Row():
@@ -1125,14 +2157,14 @@ def build_ui():
                     vc_transcript = gr.Textbox(
                         label=I18N("label_transcript"),
                         info=I18N("transcript_info"),
-                        placeholder="Точный текст того что говорится в референс-аудио",
+                        placeholder=I18N("ph_clone_transcript"),
                         lines=2,
                         elem_id="vc_transcript",
                     )
-                    vc_text = gr.Textbox(label=I18N("label_content"), placeholder="Привет, добро пожаловать в VoxCPM2!", lines=3, elem_id="vc_text")
+                    vc_text = gr.Textbox(label=I18N("label_content"), placeholder=I18N("ph_design_text"), lines=3, elem_id="vc_text")
                     vc_style = gr.Textbox(
                         label=I18N("label_style"),
-                        placeholder="например: чуть быстрее, бодрым тоном",
+                        placeholder=I18N("ph_clone_style"),
                         lines=1,
                         elem_id="vc_style",
                     )
@@ -1140,11 +2172,11 @@ def build_ui():
                     vc_seed, vc_locked = _seed_row("vc")
                     vc_btn = gr.Button(I18N("btn_clone"), variant="primary", size="lg", elem_id="vc_btn")
                 with gr.Column(scale=1):
-                    vc_out = gr.Audio(label=I18N("label_output"), type="filepath", elem_id="vc_out")
+                    vc_out = gr.Audio(label=I18N("label_output"), type="filepath", autoplay=True, elem_id="vc_out")
                     with gr.Accordion(I18N("accordion_cloud"), open=False, elem_id="vc_download_accordion"):
                         gr.Markdown(f"*Репозиторий: `{CLOUD_VOICES_REPO}`*")
                         vc_cloud_status = gr.Textbox(
-                            label="Статус",
+                            label=I18N("label_status"),
                             interactive=False,
                             value=I18N("cloud_status_initial"),
                             elem_id="vc_cloud_status",
@@ -1184,31 +2216,91 @@ def build_ui():
 
         # === Таб 4: Обучение LoRA ===
         with gr.Tab(label=I18N("tab_lora")):
-            gr.Markdown(f"### {I18N('lora_train_title')}")
-            gr.Markdown(
-                "**Как подготовить датасет:** загрузите 5-50 аудио (wav/mp3/flac, 3-15 сек каждое), "
-                "ниже в поле транскриптов построчно: `имя_файла.wav|точный текст`.\n\n"
-                "**Минимум**: 5-10 минут аудио. Оптимально — чистая запись одного голоса."
+            lora_name = gr.Textbox(
+                label=I18N("lora_auto_name"),
+                placeholder="my_voice_v1",
+                value="",
+                info=I18N("lora_name_info"),
             )
-            lora_name = gr.Textbox(label="Имя LoRA (папка-результат)", placeholder="my_voice_v1", value="")
-            lora_files = gr.Files(
-                label="Аудиофайлы (wav/mp3/flac/m4a)",
-                file_types=[".wav", ".mp3", ".flac", ".m4a", ".ogg"],
-                file_count="multiple",
-            )
-            lora_transcripts = gr.Textbox(
-                label="Транскрипты (формат: имя_файла|текст)",
-                placeholder="clip_001.wav|Здравствуйте, меня зовут Иван.\nclip_002.wav|Сегодня отличная погода.",
-                lines=8,
-            )
+
+            gr.Markdown(I18N("md_step1_title"))
+
+            # Два режима — взаимоисключающие суб-табы
+            with gr.Tabs():
+                # === АВТО из видео/аудио ===
+                with gr.Tab(label=I18N("lora_auto_title")):
+                    gr.Markdown(I18N("lora_auto_desc"))
+                    with gr.Accordion(I18N("lora_auto_how_title"), open=False):
+                        gr.Markdown(I18N("lora_auto_how_desc"))
+                    auto_file = gr.File(
+                        label=I18N("lora_auto_file"),
+                        file_types=[
+                            ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
+                            ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus",
+                        ],
+                    )
+                    with gr.Accordion(I18N("lora_auto_params"), open=False):
+                        with gr.Row():
+                            auto_min_sec = gr.Slider(1.0, 5.0, value=2.0, step=0.5, label=I18N("lora_auto_min_sec"), info=I18N("info_auto_min_sec"))
+                            auto_max_sec = gr.Slider(8.0, 20.0, value=15.0, step=1.0, label=I18N("lora_auto_max_sec"), info=I18N("info_auto_max_sec"))
+                        with gr.Row():
+                            auto_target_min = gr.Slider(2.0, 8.0, value=4.0, step=0.5, label=I18N("lora_auto_target_min"), info=I18N("info_auto_target_min"))
+                            auto_target_max = gr.Slider(6.0, 15.0, value=10.0, step=0.5, label=I18N("lora_auto_target_max"), info=I18N("info_auto_target_max"))
+                    with gr.Row():
+                        auto_tune_chk = gr.Checkbox(
+                            label=I18N("lora_auto_tune"),
+                            value=True,
+                            info=I18N("info_auto_tune"),
+                        )
+                        auto_start_train = gr.Checkbox(
+                            label=I18N("lora_auto_start_training"),
+                            value=False,
+                        )
+                    auto_btn = gr.Button(I18N("lora_auto_btn"), variant="primary", size="lg")
+                    auto_log = gr.Textbox(label=I18N("lora_auto_log"), interactive=False, lines=18)
+
+                # === РУЧНОЙ режим ===
+                with gr.Tab(label=I18N("lora_train_title")):
+                    gr.Markdown(I18N("lora_manual_desc"))
+                    lora_files = gr.Files(
+                        label=I18N("label_audio_files"),
+                        file_types=[".wav", ".mp3", ".flac", ".m4a", ".ogg"],
+                        file_count="multiple",
+                    )
+                    lora_transcripts = gr.Textbox(
+                        label=I18N("label_transcripts"),
+                        placeholder=I18N("ph_transcripts"),
+                        lines=8,
+                    )
+
+            gr.Markdown("---")
+            gr.Markdown(I18N("md_step2_title"))
+            gr.Markdown(I18N("md_step2_note"))
             with gr.Row():
-                lora_r = gr.Slider(8, 128, value=16, step=8, label="LoRA rank (r)", info="Больше = больше capacity (16 для 10-20 клипов, 32 для 50+, 64 для 500+)")
-                lora_alpha = gr.Slider(8, 128, value=16, step=8, label="LoRA alpha", info="Обычно = r")
+                lora_r = gr.Slider(8, 128, value=32, step=8, label=I18N("label_lora_r"), info=I18N("info_lora_r"))
+                lora_alpha = gr.Slider(8, 128, value=32, step=8, label=I18N("label_lora_alpha"), info=I18N("info_lora_alpha"))
             with gr.Row():
-                lora_steps = gr.Slider(100, 5000, value=300, step=50, label="Training steps", info="300 для 10-20 клипов, 500-1000 для 50-100, 2000+ для 500+")
-                lora_lr = gr.Slider(0.00001, 0.001, value=0.0001, step=0.00001, label="Learning rate", info="0.0001 стандарт")
-            lora_train_btn = gr.Button("🎓 Начать обучение", variant="primary", size="lg")
-            lora_train_log = gr.Textbox(label="Лог тренировки", interactive=False, lines=15)
+                lora_steps = gr.Slider(100, 5000, value=1000, step=50, label=I18N("label_lora_steps"), info=I18N("info_lora_steps"))
+                lora_lr = gr.Slider(0.00001, 0.001, value=0.0001, step=0.00001, label=I18N("label_lora_lr"), info=I18N("info_lora_lr"))
+
+            lora_train_btn = gr.Button(I18N("btn_train_start"), variant="primary", size="lg")
+            lora_train_log = gr.Textbox(label=I18N("label_train_log"), interactive=False, lines=15)
+
+            # --- wiring ---
+            auto_btn.click(
+                auto_prepare_dataset,
+                inputs=[
+                    lora_name, auto_file,
+                    auto_min_sec, auto_max_sec, auto_target_min, auto_target_max,
+                    auto_start_train, auto_tune_chk,
+                    lora_r, lora_alpha, lora_steps, lora_lr,
+                ],
+                outputs=[auto_log, lora_transcripts, lora_files, lora_r, lora_alpha, lora_steps, lora_lr],
+            ).then(
+                maybe_auto_train,
+                inputs=[auto_start_train, lora_name, lora_files, lora_transcripts, lora_r, lora_alpha, lora_steps, lora_lr],
+                outputs=[lora_train_log],
+            )
 
             lora_train_btn.click(
                 train_lora,
