@@ -1175,11 +1175,11 @@ def build_ui():
                 lines=8,
             )
             with gr.Row():
-                lora_r = gr.Slider(8, 128, value=32, step=8, label="LoRA rank (r)", info="Больше = больше capacity")
-                lora_alpha = gr.Slider(8, 128, value=32, step=8, label="LoRA alpha")
+                lora_r = gr.Slider(8, 128, value=16, step=8, label="LoRA rank (r)", info="Больше = больше capacity (16 для 10-20 клипов, 32 для 50+, 64 для 500+)")
+                lora_alpha = gr.Slider(8, 128, value=16, step=8, label="LoRA alpha", info="Обычно = r")
             with gr.Row():
-                lora_steps = gr.Slider(100, 5000, value=1000, step=100, label="Training steps")
-                lora_lr = gr.Slider(0.00001, 0.001, value=0.0001, step=0.00001, label="Learning rate")
+                lora_steps = gr.Slider(100, 5000, value=300, step=50, label="Training steps", info="300 для 10-20 клипов, 500-1000 для 50-100, 2000+ для 500+")
+                lora_lr = gr.Slider(0.00001, 0.001, value=0.0001, step=0.00001, label="Learning rate", info="0.0001 стандарт")
             lora_train_btn = gr.Button("🎓 Начать обучение", variant="primary", size="lg")
             lora_train_log = gr.Textbox(label="Лог тренировки", interactive=False, lines=15)
 
