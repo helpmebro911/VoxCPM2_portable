@@ -460,7 +460,7 @@ _model = None
 
 def get_model(lora_weights_path: Optional[str] = None, force_reload: bool = False) -> VoxCPM:
     """Загружает модель. При первом lora_weights_path — модель перезагружается с LoRA-структурой
-    (нужно для load_lora hot-swap в дальнейшем)."""
+    (нужно для load_lora hot-swap в дальнейшем). Читает lora_config.json из папки чекпоинта."""
     global _model
     if _model is not None and not force_reload and lora_weights_path is None:
         return _model
@@ -474,6 +474,18 @@ def get_model(lora_weights_path: Optional[str] = None, force_reload: bool = Fals
     kwargs = dict(load_denoiser=True, optimize=False)
     if lora_weights_path:
         kwargs["lora_weights_path"] = lora_weights_path
+        # Явно читаем lora_config.json и конструируем LoRAConfig — иначе voxcpm использует default (r=8)
+        import json
+        cfg_path = Path(lora_weights_path) / "lora_config.json"
+        if cfg_path.exists():
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg_data = json.load(f).get("lora_config", {})
+                from voxcpm.model.voxcpm2 import LoRAConfig as LoRAConfigV2
+                kwargs["lora_config"] = LoRAConfigV2(**cfg_data)
+                print(f"[lora] loaded lora_config.json: r={cfg_data.get('r')}, alpha={cfg_data.get('alpha')}")
+            except Exception as exc:
+                print(f"[lora] WARNING: failed to read lora_config.json: {exc}")
     _model = VoxCPM.from_pretrained(MODEL_REF, **kwargs)
     print(f"[VoxCPM2] Model loaded. Sample rate: {_model.tts_model.sample_rate} Hz")
     return _model
