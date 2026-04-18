@@ -2,7 +2,7 @@
 
 # VoxCPM2 Portable
 
-**Portable Windows build of VoxCPM2 — multilingual TTS with Voice Design & Cloning.**
+**Portable Windows build of VoxCPM2 — multilingual TTS with Voice Design, Cloning & LoRA fine-tuning.**
 
 [![Stars](https://img.shields.io/github/stars/timoncool/VoxCPM2_portable?style=flat-square)](https://github.com/timoncool/VoxCPM2_portable/stargazers)
 [![License](https://img.shields.io/github/license/timoncool/VoxCPM2_portable?style=flat-square)](LICENSE)
@@ -13,7 +13,7 @@
 
 </div>
 
-Generate natural multilingual speech, design brand-new voices from text descriptions, or clone any voice from a short reference clip — **100% local**, no cloud, no API keys, no subscriptions. One-click install on Windows, runs on any NVIDIA GPU with 8+ GB VRAM.
+Generate natural multilingual speech, design brand-new voices from text descriptions, clone any voice from a reference clip, and **train your own LoRA on ~10 audio clips** — **100% local**, no cloud, no API keys. One-click install on Windows, runs on any NVIDIA GPU with 8+ GB VRAM.
 
 Built on [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) by OpenBMB — a tokenizer-free 2B-parameter diffusion autoregressive TTS model trained on 2M+ hours of speech.
 
@@ -24,49 +24,52 @@ Built on [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) by OpenBMB — a toke
 - **Portable** — everything in one folder, copy to USB, delete = uninstall
 - **One-click** — `install.bat` → `run.bat` → generate speech
 - **30 languages** — Russian, English, Chinese, French, German, Japanese, Korean and more
+- **LoRA training in the UI** — fine-tune on your own 10-20 clips in 5-15 min on RTX 4090
 
 ## Features
 
 ### Text-to-Speech
-- **30 languages** out of the box — Russian, English, Chinese (plus 9 dialects), Arabic, French, German, Hindi, Italian, Japanese, Korean, Portuguese, Spanish and many more
-- **48 kHz studio-quality output** — AudioVAE V2 super-resolution from 16 kHz input
+- **30 languages** — RU/EN/ZH (+9 Chinese dialects)/AR/FR/DE/HI/IT/JA/KO/PT/ES + more — auto language detection
+- **48 kHz studio output** via AudioVAE V2 super-resolution (16→48 kHz)
 - **Natural prosody** — tokenizer-free diffusion autoregressive architecture
-- **Language auto-detection** — no language tags needed, paste text in any language
+- Output formats: **MP3** (default), WAV, FLAC, OGG
 
 ### Voice Design
-- **Create voices from text** — describe gender, age, tone, emotion, pace, accent
-- **Zero-shot** — no reference audio required
-- **Examples** — "A young woman with a soft voice" / "An elderly man with a deep baritone"
+- Create voices from **text description** — gender, age, tone, emotion, pace, accent
+- Zero-shot — no reference audio needed
+- 6 ready-made examples (EN+RU) with one-click fill
 
-### Voice Cloning
-- **Clone any voice** from 5-30 seconds of clean audio (up to 50 seconds)
-- **Style control** — steer emotion/pace while preserving timbre: "slightly faster, cheerful tone"
-- **Microphone recording** — record reference directly in the browser
-- **Denoise with ZipEnhancer** — automatic cleanup of noisy references
+### Voice Cloning (with optional Ultimate mode)
+- Clone any voice from **5-50 seconds** of reference audio
+- **Voice pack** bundled (~100 voices, RU/EN/FR/DE/JP/KR/AR)
+- Extra **743 Russian voices** on-demand from `Slait/russia_voices`
+- Style control: `slightly faster, cheerful tone` / `whispering, intimate` / `slow and dramatic`
+- **Ultimate mode** — fill transcript field → model uses `prompt_wav_path + prompt_text + reference_wav_path` for max fidelity
+- Optional **ZipEnhancer denoise** for noisy references
 
-### Ultimate Cloning
-- **Maximum fidelity** — reference audio + exact transcript
-- **Continuation mode** — model "continues" reference audio preserving every vocal nuance
-- **Best for production** — audiobooks, voiceovers, character consistency
+### LoRA Fine-Tuning (in the UI!)
+- Train on **10-20 clips** (~5-10 min audio) → custom voice adaptation in 5-15 min on RTX 4090
+- Bundled training script from OpenBMB (`training/scripts/train_voxcpm_finetune.py`)
+- Live progress log
+- Saved to `lora/<name>/step_XXXX/` — auto-appears in dropdown
+- **Hot-swap**: switch between LoRAs without restart via `unload_lora` + `load_lora`
+- Works across all modes (TTS / Voice Design / Voice Cloning)
+
+### All model parameters exposed
+CFG Scale · Inference Steps · Min/Max length · Retry-on-bad-case · Retry max attempts · Retry ratio threshold · Text normalization (wetext) · Denoise reference · Streaming (live progress) · Seed + Lock
 
 ### Interface
-- **Bilingual UI** — Russian + English, auto-detected from browser language
-- **Dark theme** — forced dark mode for comfortable work
-- **Seed + Lock** — reproducible generations
-- **Advanced settings** — CFG Scale, Inference Steps, text normalization (wetext), denoise, retry
-- **Auto-download** — model (~4-5 GB) downloads automatically on first run
-- **Auto-port, auto-browser** — no manual port config, opens in browser automatically
+- **i18n RU/EN** via `gr.I18n` — switch via browser language
+- **Dark theme** with gradient header
+- **Bundled FFmpeg** portable (for MP3/OGG encoding)
+- **Auto-download** — model (~4-5 GB) + voice pack on first run
+- **Auto-port, auto-browser** — opens on `localhost` automatically
 
-### Out-of-the-box GPU Accelerators
-All compatible accelerators installed automatically based on your GPU:
-
-| GPU | Triton | Flash Attention 2 | xformers |
-|-----|--------|-------------------|----------|
-| GTX 10xx (Pascal) | ✅ | ❌ | ✅ |
-| RTX 20xx (Turing) | ✅ | ❌ | ✅ |
-| RTX 30xx (Ampere) | ✅ | ✅ | ✅ |
-| RTX 40xx (Ada) | ✅ | ✅ | ✅ |
-| RTX 50xx (Blackwell) | ✅ | ✅ | ✅ |
+### GPU Accelerators (out of the box)
+| GPU | Flash Attention 2 | SDPA flash | bfloat16 | AMP (training) |
+|-----|:---:|:---:|:---:|:---:|
+| RTX 30xx / 40xx / 50xx | ✅ | ✅ | ✅ | ✅ |
+| GTX 10xx / RTX 20xx | ❌ | ✅ | ✅ | ✅ |
 
 ## System Requirements
 
@@ -74,82 +77,82 @@ All compatible accelerators installed automatically based on your GPU:
 |-----------|---------|-------------|
 | GPU VRAM | 8 GB | 12+ GB |
 | RAM | 16 GB | 32 GB |
-| Disk | 15 GB | 30 GB |
+| Disk | 15 GB | 30 GB (with voice pack & LoRA) |
 | OS | Windows 10/11 | Windows 11 |
 | GPU | RTX 2080 / RTX 3060 | RTX 4070+ |
 
-CPU-only mode works but is experimentally slow (minutes per short phrase).
+CPU-only mode supported but **very slow** (minutes per phrase).
 
 ## Quick Start
 
 ### 1. Clone
-
 ```bash
 git clone https://github.com/timoncool/VoxCPM2_portable.git
 cd VoxCPM2_portable
 ```
 
 ### 2. Install
-
 ```
 install.bat
 ```
-
-Select your GPU type (6 options). Installs portable Python 3.12, PyTorch 2.7, voxcpm, plus all compatible GPU accelerators — nothing system-wide.
+Select your GPU type (6 options). Installs portable Python 3.12 + PyTorch 2.7.1 + voxcpm + Flash Attention 2 + FFmpeg + default voice pack. Nothing system-wide.
 
 ### 3. Run
-
 ```
 run.bat
 ```
-
-Browser opens automatically. On first run the model downloads to `models/` (~4-5 GB).
+Browser opens automatically. Model downloads on first run (~4-5 GB to `models/`).
 
 ## Launchers
 
 | Script | Description |
 |--------|-------------|
-| `install.bat` | One-click installer — Python + PyTorch + voxcpm + accelerators + FFmpeg |
-| `run.bat` | Launch the Gradio UI with full environment isolation |
-| `update.bat` | Update portable wrapper and voxcpm package |
+| `install.bat` | One-click installer — Python + PyTorch + voxcpm + accelerators + FFmpeg + voice pack |
+| `run.bat` | Launch Gradio UI with full environment isolation |
+| `update.bat` | Update portable wrapper + voxcpm package |
+
+## LoRA Training Workflow
+
+1. **Prepare dataset**: 10-50 WAV/MP3 clips (3-15 sec each) of one speaker + their transcripts
+2. Open **LoRA** tab in the UI
+3. Drag-and-drop audio files
+4. Paste transcripts (format: `filename.wav|exact transcript text`, one per line)
+5. Set **Name** for your LoRA
+6. Defaults are tuned for **10-20 clips**: `r=16`, `alpha=16`, `steps=300`, `lr=0.0001`
+7. Click **🎓 Start training** — wait 5-15 min on RTX 4090
+8. Checkpoint appears in `lora/<name>/step_XXXX/` and in dropdown in all tabs
+9. Select your LoRA in **Advanced settings → 🧬 LoRA** to activate (first activation takes ~30-60 sec to reload model with LoRA structure; subsequent switches are instant hot-swap)
+
+### Recommended LoRA settings by dataset size
+
+| Clips | Steps | r / α | LR |
+|---|---|---|---|
+| **10-20** (default) | **300** | 16/16 | 0.0001 |
+| 50-100 | 500-1000 | 32/32 | 0.0001 |
+| 200+ | 1000-2000 | 32/32 or 64/64 | 0.00005-0.0001 |
+| 1000+ | 2000-5000 | 64/64 | 0.00005 |
 
 ## Architecture
 
 ```
 VoxCPM2_portable/
-├── app.py              # Gradio UI (RU/EN, 4 tabs, dark theme)
+├── app.py              # Gradio UI (4 tabs: TTS / Voice Design / Cloning / LoRA)
 ├── install.bat         # GPU selector + installer
 ├── run.bat             # Launcher with env isolation
 ├── update.bat          # Updater
-├── requirements.txt    # voxcpm + gradio + soundfile + numpy
+├── requirements.txt    # Python dependencies
+├── training/
+│   ├── scripts/        # Official OpenBMB train & inference scripts (bundled)
+│   └── conf/           # YAML config templates
 ├── python/             # Portable Python 3.12 (created by install.bat)
-├── models/             # HuggingFace cache (VoxCPM2 weights ~4-5 GB)
-├── ffmpeg/             # Portable FFmpeg (for wide audio format support)
-├── output/             # Generated WAV files with timestamps
-├── cache/              # General cache
-└── temp/               # Temporary files (Gradio)
+├── models/             # HuggingFace cache (VoxCPM2 ~4-5 GB, ZipEnhancer, SenseVoice)
+├── voices/             # Voice pack (bundled default ~100 voices + user downloads)
+├── lora/               # Trained LoRA checkpoints (lora/<name>/step_XXXX/)
+├── train_data/         # User LoRA datasets (audio + transcripts)
+├── ffmpeg/             # Portable FFmpeg (for MP3/OGG encoding)
+├── output/             # Generated audio files with timestamps
+├── cache/ / temp/      # General cache / tempdir
 ```
-
-## How to Use
-
-### Text-to-Speech
-Just enter text in any supported language — the model auto-detects the language.
-
-### Voice Design
-Describe the voice you want in "Voice description" (e.g. "A young woman, gentle and sweet voice"), then enter what it should say. Results vary between runs — try 1-3 times and lock the seed when you find the voice you want.
-
-### Voice Cloning
-Upload a 5-30 second clean recording. Optionally set a style: "slightly faster, cheerful tone" / "slow and dramatic" / "whispering, intimate".
-
-### Ultimate Cloning
-Best quality mode. Provide reference audio **and** its exact transcript. Use the **same** file as both reference and prompt for maximum similarity.
-
-### Advanced Settings
-- **CFG Scale** (0.5–5.0) — how closely to follow the prompt/reference. 2.0 is recommended.
-- **Inference Steps** (5–30) — diffusion steps. 10 balances quality and speed.
-- **Seed + Lock Seed** — reproducible generations
-- **Text normalization** — auto-processes numbers, dates, abbreviations via wetext
-- **Denoise reference** — ZipEnhancer cleanup before cloning
 
 ## Updating
 
@@ -157,14 +160,12 @@ Best quality mode. Provide reference audio **and** its exact transcript. Use the
 update.bat
 ```
 
-Pulls latest wrapper code, upgrades `voxcpm` package.
-
 ## Links
 
 - [OpenBMB / VoxCPM](https://github.com/OpenBMB/VoxCPM) — original project
-- [VoxCPM2 model card](https://huggingface.co/openbmb/VoxCPM2) — model weights
+- [VoxCPM2 model card](https://huggingface.co/openbmb/VoxCPM2) — weights
 - [Demo page with audio samples](https://openbmb.github.io/voxcpm2-demopage/)
-- [Official documentation](https://voxcpm.readthedocs.io/)
+- [Fine-tuning Guide](https://voxcpm.readthedocs.io/en/latest/finetuning/finetune.html)
 
 ## Other Portable Neural Networks
 
@@ -187,15 +188,13 @@ Pulls latest wrapper code, upgrades `voxcpm` package.
 ## Acknowledgments
 
 - **[OpenBMB / VoxCPM team](https://github.com/OpenBMB/VoxCPM)** — open source VoxCPM2 model
-- **[AIQuest Academy](https://github.com/TeamAIQ/Colab-notebooks)** — Colab notebook reference for the 4-tab UI structure
-- **[mjun0812](https://github.com/mjun0812/flash-attention-prebuild-wheels)** — Windows wheels for Flash Attention 2
-- **[woct0rdho / triton-windows](https://pypi.org/project/triton-windows/)** — Triton port for Windows
-- **[Gradio](https://gradio.app/)** — ML model UI framework
-- **[FFmpeg](https://ffmpeg.org/)** — audio processing
+- **[Slait/russia_voices](https://huggingface.co/datasets/Slait/russia_voices)** — 743 Russian voice presets
+- **[AIQuest Academy](https://github.com/TeamAIQ/Colab-notebooks)** — Colab UI reference
+- **[lldacing/flash-attention-windows-wheel](https://huggingface.co/lldacing/flash-attention-windows-wheel)** — Windows Flash Attention 2 wheels
+- **[Gradio](https://gradio.app/)** — UI framework
+- **[FFmpeg](https://ffmpeg.org/)** — audio encoding
 
 ## Support This Project
-
-I build software and do research in AI. Most of what I create is free and open source.
 
 **[All donation methods](https://dalink.to/nerual_dreming)** | **[boosty.to/neuro_art](https://boosty.to/neuro_art)**
 
