@@ -17,3 +17,4 @@ argbind
 tensorboardX
 safetensors
 pyyaml
+datasets<4  # для prepare_test_dataset.py (скачать тестовый датасет с HF)
