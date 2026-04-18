@@ -812,15 +812,12 @@ button.primary {
 .lora-refresh-btn {
   max-width: 44px !important;
   flex: 0 0 44px !important;
-  align-self: flex-end !important;
-  margin-top: auto !important;
-  margin-bottom: 4px !important;
 }
 .lora-refresh-btn button {
   padding: 0 !important;
   min-width: 0 !important;
   width: 44px !important;
-  height: 42px !important;
+  height: 100% !important;
 }
 """
 
@@ -881,13 +878,15 @@ def _advanced_block(prefix: str, show_denoise: bool = False):
     with gr.Accordion(label=I18N("label_advanced"), open=False, elem_id=f"{prefix}_advanced"):
         _NONE = "-- Без LoRA --"
         _choices = [_NONE] + scan_local_loras()
-        with gr.Row(equal_height=False):
+        gr.Markdown("**🧬 LoRA**")
+        with gr.Row(equal_height=True):
             lora_sel = gr.Dropdown(
-                label="🧬 LoRA", choices=_choices,
+                show_label=False, choices=_choices,
                 value=(_ACTIVE_LORA if _ACTIVE_LORA in _choices else _NONE),
-                interactive=True, scale=20, min_width=200, elem_id=f"{prefix}_lora",
+                interactive=True, scale=20, min_width=200,
+                container=False, elem_id=f"{prefix}_lora",
             )
-            lora_refresh = gr.Button("🔄", size="sm", scale=0, min_width=40, elem_classes=["lora-refresh-btn"], elem_id=f"{prefix}_lora_refresh")
+            lora_refresh = gr.Button("🔄", size="sm", scale=0, min_width=44, elem_classes=["lora-refresh-btn"], elem_id=f"{prefix}_lora_refresh")
 
         lora_sel.change(
             fn=lambda n: lora_detach() if n == _NONE else lora_attach(n),
