@@ -301,7 +301,7 @@ def prepare_train_data(name: str, files: list, transcripts_text: str) -> tuple[P
         tx = tr_map.get(src.name) or tr_map.get(src.stem) or ""
         if not tx:
             continue  # без транскрипта пропускаем
-        manifest.append({"audio_filepath": str(dst), "text": tx})
+        manifest.append({"audio": str(dst), "text": tx})
 
     manifest_path = ds_dir / "train.jsonl"
     with open(manifest_path, "w", encoding="utf-8") as f:
