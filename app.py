@@ -866,12 +866,12 @@ def _advanced_block(prefix: str, show_denoise: bool = False):
         def _toggle_lora(enabled, name):
             if not enabled:
                 lora_detach()
-                return gr.update(visible=False)
+                return gr.update(visible=False), gr.update()
             if name and name != "(пусто — обучи в табе LoRA)":
                 lora_attach(name)
-            return gr.update(visible=True, choices=scan_local_loras() or ["(пусто — обучи в табе LoRA)"])
+            return gr.update(visible=True), gr.update(choices=scan_local_loras() or ["(пусто — обучи в табе LoRA)"])
 
-        use_lora.change(_toggle_lora, inputs=[use_lora, lora_sel], outputs=[lora_row])
+        use_lora.change(_toggle_lora, inputs=[use_lora, lora_sel], outputs=[lora_row, lora_sel])
         lora_sel.change(
             fn=lambda n: lora_attach(n) if n and n != "(пусто — обучи в табе LoRA)" else None,
             inputs=[lora_sel],
@@ -1018,10 +1018,9 @@ _HEAD_SCRIPT = """
 
 
 def build_ui():
-    # Gradio 6.10: theme/css passed to launch(), not Blocks()
+    # Gradio 6.10: theme/css/head passed to launch(), not Blocks()
     with gr.Blocks(
         title="VoxCPM2 — Multilingual TTS",
-        head=_HEAD_SCRIPT,
         delete_cache=(300, 3600),
     ) as demo:
         gr.HTML(I18N("brand_header_html"))
@@ -1201,5 +1200,6 @@ if __name__ == "__main__":
         i18n=I18N,
         theme=gr.themes.Soft(primary_hue="purple"),
         css=_CSS,
+        head=_HEAD_SCRIPT,
         show_error=True,
     )
