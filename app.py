@@ -1481,21 +1481,24 @@ TTS_EXAMPLES = [
 ]
 
 DESIGN_EXAMPLES = [
-    ["Молодая женщина, нежный и мягкий голос", "Привет, добро пожаловать в VoxCPM2!"],
-    ["Пожилой мужчина с глубоким баритоном, говорит медленно и внушительно", "Давным-давно, в далёкой галактике..."],
-    ["Весёлый ребёнок, энергично и быстро", "Ура! Сегодня выходной!"],
+    # Все описания голоса строго на английском — VoxCPM2 парсит стиль-промпт
+    # только по английским фразам, русский просто читается вслух.
     ["A young woman with a soft gentle voice", "Hello, welcome to VoxCPM2!"],
     ["An elderly British man, deep and authoritative", "Once upon a time, in a galaxy far far away..."],
     ["A cheerful child, energetic and playful", "Yay! It's weekend today!"],
+    ["A confident radio host, clear and engaging", "Good morning everyone, and welcome back to the show!"],
+    ["A mysterious narrator, slow and atmospheric", "In the depths of the ancient forest, secrets lay buried for centuries."],
+    ["A young man, calm and thoughtful", "Let me tell you something I've been thinking about lately."],
 ]
 
 CLONE_STYLE_EXAMPLES = [
-    "чуть быстрее, бодрым тоном",
-    "медленно и драматично",
-    "шёпотом, интимно",
+    # Стиль должен быть на английском (см. комментарий выше у DESIGN_EXAMPLES)
     "slightly faster, cheerful tone",
     "slow and dramatic",
     "whispering, intimate",
+    "sad and melancholic",
+    "angry and intense",
+    "calm and reassuring",
 ]
 
 
@@ -2046,10 +2049,10 @@ I18N = gr.I18n(
         "lora_name_info": "Используется и для папки датасета (train_data/<имя>/), и для папки LoRA (lora/<имя>/)",
         # --- Placeholders ---
         "ph_tts_text": "Введите текст на любом из 30 поддерживаемых языков...",
-        "ph_design_desc": "например: Молодая женщина, нежный и мягкий голос",
+        "ph_design_desc": "A young woman with a soft gentle voice",
         "ph_design_text": "Привет, добро пожаловать в VoxCPM2!",
         "ph_clone_transcript": "Точный текст того что говорится в референс-аудио",
-        "ph_clone_style": "например: чуть быстрее, бодрым тоном",
+        "ph_clone_style": "slightly faster, cheerful tone",
         "ph_transcripts": "clip_001.wav|Здравствуйте, меня зовут Иван.\nclip_002.wav|Сегодня отличная погода.",
         # --- Info hints ---
         "info_auto_min_sec": "Клипы короче отбрасываются",
