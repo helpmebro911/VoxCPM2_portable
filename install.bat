@@ -30,9 +30,9 @@ echo Выберите поколение вашей видеокарты Nvidia:
 echo.
 echo 1. GTX 10xx серия (Pascal) - CUDA 11.8
 echo 2. RTX 20xx серия (Turing) - CUDA 11.8
-echo 3. RTX 30xx серия (Ampere) - CUDA 12.6
-echo 4. RTX 40xx серия (Ada Lovelace) - CUDA 12.8
-echo 5. RTX 50xx серия (Blackwell) - CUDA 12.8
+echo 3. RTX 30xx серия (Ampere) - CUDA 11.8 (стабильно, без Flash Attention 2)
+echo 4. RTX 40xx серия (Ada Lovelace) - CUDA 12.8 + Flash Attention 2
+echo 5. RTX 50xx серия (Blackwell) - CUDA 12.8 + Flash Attention 2
 echo 6. CPU only (без GPU, медленнее)
 echo.
 set /p GPU_CHOICE="Введите номер (1-6): "
@@ -50,8 +50,8 @@ if "%GPU_CHOICE%"=="2" (
     set "TORCHAUDIO_VERSION=2.7.1"
 )
 if "%GPU_CHOICE%"=="3" (
-    set "CUDA_VERSION=cu126"
-    set "CUDA_NAME=CUDA 12.6"
+    set "CUDA_VERSION=cu118"
+    set "CUDA_NAME=CUDA 11.8 (стабильно для Ampere)"
     set "TORCH_VERSION=2.7.1"
     set "TORCHAUDIO_VERSION=2.7.1"
 )
@@ -181,13 +181,9 @@ echo.
 
 REM Устанавливаем flash-attn в зависимости от GPU
 if "%GPU_CHOICE%"=="3" (
-    echo Установка Flash Attention 2 для RTX 30xx...
-    python\python.exe -m pip install https://huggingface.co/lldacing/flash-attention-windows-wheel/resolve/main/flash_attn-2.7.4+cu126torch2.6.0cxx11abiFALSE-cp312-cp312-win_amd64.whl --no-warn-script-location
-    if errorlevel 1 (
-        echo Не удалось установить Flash Attention 2. Приложение будет работать медленнее.
-    ) else (
-        echo Flash Attention 2 установлен успешно!
-    )
+    echo Flash Attention 2 пропущен для RTX 30xx на CUDA 11.8
+    echo   ^(нет совместимой wheel под cu118+torch2.7, приложение работает через SDPA^)
+    echo   Ускорение вернётся автоматически когда появится подходящая сборка.
 )
 if "%GPU_CHOICE%"=="4" (
     echo Установка Flash Attention 2 для RTX 40xx...
