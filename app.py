@@ -1241,8 +1241,8 @@ def _generate_audio_stream(model, kwargs: dict, streaming: bool, progress):
     gen = model.generate_streaming(**kwargs)
     buf = []
     buf_samples = 0
-    prebuffer_samples = int(sr * 2.5)   # 2.5 сек initial buffer
-    chunk_samples = int(sr * 1.0)        # 1 сек на каждый последующий yield
+    prebuffer_samples = int(sr * 8.0)   # 8 сек initial buffer (щедрый head-start)
+    chunk_samples = int(sr * 2.0)        # 2 сек на каждый последующий yield
     any_yielded = False
     for i, chunk in enumerate(gen):
         arr = np.asarray(chunk)
