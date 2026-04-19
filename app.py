@@ -1236,11 +1236,13 @@ def _generate_audio_stream(model, kwargs: dict, streaming: bool, progress):
         wav = _collect_audio(model.generate(**kwargs))
         yield sr, wav
         return
-    # streaming: буферим до ~1 сек (Gradio docs: chunks >1s = плавное воспроизведение)
+    # streaming с пре-буферизацией: первый yield — 2.5 сек (pre-buffer чтобы
+    # плеер не запинался на старте), дальше — по 1 сек для progressive playback
     gen = model.generate_streaming(**kwargs)
     buf = []
     buf_samples = 0
-    min_chunk_samples = int(sr * 1.0)  # 1 sec minimum per yield
+    prebuffer_samples = int(sr * 2.5)   # 2.5 сек initial buffer
+    chunk_samples = int(sr * 1.0)        # 1 сек на каждый последующий yield
     any_yielded = False
     for i, chunk in enumerate(gen):
         arr = np.asarray(chunk)
@@ -1252,7 +1254,8 @@ def _generate_audio_stream(model, kwargs: dict, streaming: bool, progress):
             progress(min(0.99, i / 120), desc=f"Chunk {i+1}")
         except Exception:
             pass
-        if buf_samples >= min_chunk_samples:
+        threshold = prebuffer_samples if not any_yielded else chunk_samples
+        if buf_samples >= threshold:
             yield sr, np.concatenate(buf)
             any_yielded = True
             buf = []
