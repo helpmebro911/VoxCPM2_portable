@@ -2377,7 +2377,8 @@ if __name__ == "__main__":
     demo = build_ui()
     demo.queue(default_concurrency_limit=1).launch(
         server_port=None,
-        inbrowser=True,
+        # NO_AUTO_BROWSER=true → skip opening system browser (Pinokio & other launchers open their own tab)
+        inbrowser=(os.environ.get("NO_AUTO_BROWSER", "").lower() not in ("1", "true", "yes")),
         i18n=I18N,
         theme=gr.themes.Soft(primary_hue="purple"),
         css=_CSS,
